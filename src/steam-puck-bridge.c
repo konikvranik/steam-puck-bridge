@@ -181,6 +181,15 @@ typedef struct {
     uint32_t last_buttons;
     int32_t  last_abs[6];       /* X Y RX RY Z RZ */
     int32_t  last_hat[2];
+
+    /* diagnostics: which report IDs arrive (and how often) per slot, so a
+     * silent "controller connected but no input" situation can be told apart
+     * from "no reports at all" from the journal alone */
+    uint32_t rpt_count[256];
+    uint64_t last_rpt_summary_ms;
+    bool     unknown_logged[256];   /* first-seen log for unknown report IDs */
+    bool     lizard_ok_logged;
+    bool     lizard_fail_logged;
 } slot_t;
 
 static slot_t slots[MAX_SLOTS];
@@ -315,7 +324,19 @@ static void send_lizard_off(slot_t *s)
     buf[5] = 0;
 
     /* Feature report to an empty slot fails; that's expected and harmless. */
-    ioctl(s->hid_fd, HIDIOCSFEATURE(sizeof(buf)), buf);
+    int rc = ioctl(s->hid_fd, HIDIOCSFEATURE(sizeof(buf)), buf);
+    /* Log the first outcome per slot: a persistent failure here means the
+     * bridge never disabled lizard mode, which shows up as "controller does
+     * nothing in Kodi" — worth seeing in the journal without --dump. */
+    if (rc < 0 && !s->lizard_fail_logged) {
+        logts("lizard-off feature report failed on %s: %m%s",
+              s->hidraw_path,
+              s->connected ? "" : " (empty slot, expected)");
+        s->lizard_fail_logged = true;
+    } else if (rc >= 0 && !s->lizard_ok_logged) {
+        logts("lizard mode off on %s (feature report ok)", s->hidraw_path);
+        s->lizard_ok_logged = true;
+    }
     s->last_lizard_ms = now_ms();
 }
 
@@ -601,6 +622,65 @@ static void handle_uinput_event(slot_t *s)
 
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* Diagnostics: per-slot report-ID summary, logged at most every 30 s when
+ * anything arrived. Rationale: on kiosk hardware the dongle sometimes emits
+ * connection status but no controller-state reports (0x42/0x45/0x47) until
+ * the Valve runtime (Steam Link) has initialized the dongle — this summary
+ * makes that state visible in the journal without running --dump. */
+
+#define RPT_SUMMARY_INTERVAL_MS 30000
+
+static const char *rpt_name(uint8_t id)
+{
+    switch (id) {
+    case ID_TRITON_CONTROLLER_STATE:        return "state";
+    case ID_TRITON_CONTROLLER_STATE_BLE:    return "state-ble";
+    case ID_TRITON_CONTROLLER_STATE_TIMESTAMP: return "state-ts";
+    case ID_TRITON_BATTERY_STATUS:          return "battery";
+    case ID_TRITON_WIRELESS_STATUS:         return "wl-status";
+    case ID_TRITON_WIRELESS_STATUS_X:       return "wl-status-x";
+    default: return NULL;
+    }
+}
+
+static void maybe_log_report_summary(slot_t *s, uint64_t now)
+{
+    if (now - s->last_rpt_summary_ms < RPT_SUMMARY_INTERVAL_MS)
+        return;
+    s->last_rpt_summary_ms = now;
+
+    char line[512];
+    size_t off = 0;
+    line[0] = '\0';
+    for (int id = 0; id < 256; id++) {
+        if (s->rpt_count[id] == 0)
+            continue;
+        const char *name = rpt_name((uint8_t)id);
+        int n = snprintf(line + off, sizeof(line) - off, "%s%s0x%02x(%s)x%u",
+                         off ? ", " : "", off ? "" : "", id,
+                         name ? name : "?", s->rpt_count[id]);
+        if (n < 0 || (size_t)n >= sizeof(line) - off)
+            break;
+        off += (size_t)n;
+        s->rpt_count[id] = 0;
+    }
+    if (off)
+        logts("[%s if%d] reports last %us: %s (connected=%d pad=%s)",
+              s->hidraw_path, s->iface, RPT_SUMMARY_INTERVAL_MS / 1000, line,
+              s->connected, s->ui_fd >= 0 ? "yes" : "no");
+}
+
+static void count_report(slot_t *s, const uint8_t *d)
+{
+    s->rpt_count[d[0]]++;
+    if (!rpt_name(d[0]) && !s->unknown_logged[d[0]]) {
+        logts("[%s if%d] first report with unknown ID 0x%02x (len seen later "
+              "in summary)", s->hidraw_path, s->iface, d[0]);
+        s->unknown_logged[d[0]] = true;
+    }
+}
+
 static void dump_report(slot_t *s, const uint8_t *d, int len)
 {
     char hex[3 * 64 + 1];
@@ -758,6 +838,8 @@ int main(int argc, char **argv)
                 continue;
             if (now - s->last_lizard_ms >= LIZARD_HEARTBEAT_MS)
                 send_lizard_off(s);
+            if (!opt_dump)
+                maybe_log_report_summary(s, now);
             if (s->rumble_active) {
                 if (s->rumble_until_ms && now >= s->rumble_until_ms) {
                     s->rumble_active = false;
@@ -822,6 +904,7 @@ int main(int argc, char **argv)
                     dump_report(s, buf, n);
                     continue;
                 }
+                count_report(s, buf);
                 switch (buf[0]) {
                 case ID_TRITON_CONTROLLER_STATE:
                 case ID_TRITON_CONTROLLER_STATE_BLE:
